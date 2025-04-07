@@ -1,0 +1,12 @@
+---
+localhost:
+  hosts:
+    lhost:
+      ansible_connection: local
+
+colo_machine:
+  hosts:
+    test01:
+      ansible_host: 3.111.204.236
+      ansible_user: root
+      ansible_port: 20004

@@ -1,0 +1,711 @@
+---
+- hosts: all  #currently written to be executed in a docker container
+  # become: true #docker pull autodhuser/titan:jammy-tools
+  gather_facts: no
+  vars:           #packages to be installed in the container: sshpass, ansible(and dependencies listed in text file), apt-rdepends
+    ZANSKAR_CLANG_VERSION: 19
+    ZANSKAR_GCC_VERSION: 13
+    gcc_deb_download:
+      # - apt update && apt upgrade -y
+      - "mkdir -p /home/swathi/ansible/gcc13"
+      - "cd /home/swathi/ansible/gcc13 && for package in $(apt-rdepends g++-13 | grep -v '^ '); do apt download $package; done"
+      - "cd /home/swathi/ansible/gcc13 && apt download libatomic1"
+    services_to_disable:
+      - apt-daily.timer
+      - apt-daily-upgrade.timer
+      - colord.service
+      - cups.service
+      - gdm.service
+      - gdm3.service
+      - motd-news.timer
+      - run-snapd-ns.mount
+      - snapd.apparmor.service
+      - snapd.mounts-pre.target
+      - snapd.mounts.target
+      - snapd.seeded.service
+      - snapd.service
+      - snapd.socket
+      - snap-core20-1587.mount
+      - snap-lxd-22923.mount
+      - snap-sabnzbd-6023.mount
+      - snap-snapd-16292.mount
+      - systemd-timesyncd.service
+      - unattended-upgrades.service
+      - update-notifier-download.timer
+      - update-notifier-motd.timer
+    exanic_mod_commands:
+      - rmmod exasock
+      - rmmod exanic
+      - modprobe exanic
+      - modprobe exasock
+
+  tasks:
+    - name: Check if hosts are live
+      ansible.builtin.ping:
+      tags: ping
+
+    - name: removing apt.conf if already exists
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: /etc/apt/apt.conf
+        state: absent
+      ignore_errors: yes
+      tags: apt_conf
+
+    - name: creating apt.conf file in /etc/apt
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: /etc/apt/apt.conf
+        state: touch
+      tags: apt_conf
+
+    - name: Editing apt.conf
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: "/etc/apt/apt.conf"
+        line: |
+          Acquire::http::Proxy "http://localhost:{{ port_no }}";
+          Acquire::https::Proxy "https://localhost:{{ port_no }}";
+      tags: apt_conf
+
+    - name: apt update and upgrade
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: apt update && apt upgrade -y
+      tags: apt_packages
+
+    - name: Package cache update and install updates
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.apt:
+        pkg:
+          - acl
+          - byobu
+          - gdb
+          - htop
+          - hwinfo
+          - jq
+          - libnl-3-dev
+          - libnl-genl-3-dev
+          - lm-sensors
+          - make
+          - net-tools
+          - pkg-config
+          - python3-pip
+          - python3.10-venv
+          - stress
+          - stress-ng
+          - tree
+          - tshark
+          - vim
+          - i7z
+          - sysstat
+
+        state: present
+        update_cache: true
+      tags: apt_packages
+
+    - name: community.general installation
+      when: inventory_hostname in groups['localhost']
+      ansible.builtin.shell: ansible-galaxy collection install community.general
+      tags: apt_packages
+
+    - name: hide pid of other users
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "proc   /proc           proc   defaults,hidepid=2        0 0"
+      tags: hidepid
+
+    - name: Installing linux-azure kernel
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.apt:
+        pkg:
+          - linux-buildinfo-6.2.0-1018-azure
+          - linux-cloud-tools-6.2.0-1018-azure
+          - linux-headers-6.2.0-1018-azure
+          - linux-image-6.2.0-1018-azure
+          - linux-image-6.2.0-1018-azure-fde
+          - linux-modules-6.2.0-1018-azure
+          - linux-modules-extra-6.2.0-1018-azure
+          - linux-tools-6.2.0-1018-azure
+        state: present
+        update_cache: true
+      tags:
+        - azure_kernel
+        - azure_packages
+
+    - name: Editing etc/sysctl.conf
+      when: inventory_hostname in groups['colo_machine']
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+      with_items:
+        - { name: "kernel.sched_rt_runtime_us", value: "-1" }
+        - { name: "vm.stat_interval", value: "120" }
+        - { name: "kernel.nmi_watchdog", value: "0" }
+        - { name: "kernel.watchdog", value: "0" }
+        - { name: "kernel.soft_watchdog", value: "0" }
+        - { name: "vm.compaction_proactiveness", value: "0" }
+        - { name: "kernel.core_pattern", value: "|/usr/local/bin/handle_core_dump.sh %p %e %u %g %t" }
+      tags:
+        - azure_kernel
+        - kernel_params
+
+    - name: generate usr/local/bin/handle_core_dump.sh
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.blockinfile:
+        path: /usr/local/bin/handle_core_dump.sh
+        block: |
+          #!/bin/bash
+
+          # Usage: (save this file to /usr/local/bin/handle_core_dump.sh)
+          #       chmod +x /usr/local/bin/handle_core_dump.sh
+          #       echo "|/usr/local/bin/handle_core_dump.sh %p %e %u %g %t" | sudo tee /proc/sys/kernel/core_pattern
+
+          PID_NUM="${1}"
+          BIN_NAME="${2}"
+          USER_UID="${3}"
+          USER_GID="${4}"
+          TIME_NUM="${5}"
+          CWD_PATH=$(readlink -f "/proc/${PID_NUM}/cwd")
+          EXE_NAME=$(readlink -f "/proc/${PID_NUM}/exe")
+          USER_TTY=$(readlink -f "/proc/${PID_NUM}/fd/2")
+          CORE_FILENAME="core.${BIN_NAME}.${TIME_NUM}.${PID_NUM}"
+
+          # Dump the stdin to coredump
+          cat > "${CWD_PATH}/${CORE_FILENAME}" < /dev/stdin
+
+          # Fix ownership of the file
+          chown ${USER_UID}:${USER_GID} "${CWD_PATH}/${CORE_FILENAME}" 
+
+          # Dump backtrace
+          gdb -q -n -batch-silent                                         \
+                  -ex "set logging overwrite off"                         \
+                  -ex "set logging file ${USER_TTY}"                      \
+                  -ex "set logging on"                                    \
+                  -ex "set pagination off"                                \
+                  -ex "set print address off"                             \
+                  -ex "set print pretty on"                               \
+                  -ex "set print demangle"                                \
+                  -ex "echo \nBACKTRACE:\n"                               \
+                  -ex "backtrace 16"                                      \
+                  -ex "quit"                                              \
+                  ${EXE_NAME}                                             \
+                  -c "${CWD_PATH}/${CORE_FILENAME}"
+
+          # Compress the core.
+          zstd -q "${CWD_PATH}/${CORE_FILENAME}"
+
+          # Remove the core.
+          rm "${CWD_PATH}/${CORE_FILENAME}"
+        create: yes
+        mode: '0755'
+      tags:
+        - azure_kernel
+        - kernel_params
+
+    - name: Editing grub file
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: 'GRUB_CMDLINE_LINUX="selinux=0 intel_idle.max_cstate=0 processor.max_cstate=1 audit=0 pcie_aspm=performance pci=noaer mitigations=off isolcpus=nohz,domain,managed_irq,0-19 nohz_full=0-19 rcu_nocbs=0-19 irqaffinity=20,21,22,23 numa_balancing=disable clocksource=tsc tsc=reliable ipv6.disable=1 transparent_hugepage=never zswap.enabled=0 mce=off cpuhp.off hugepagesz=2M hugepages=2048"'
+      tags:
+        - azure_kernel
+        - grub_defaults
+
+    - name: Editing grub file 2
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX_DEFAULT='
+        line: 'GRUB_CMDLINE_LINUX_DEFAULT=""'
+      tags:
+        - azure_kernel
+        - grub_defaults
+
+    - name: Update-grub command
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: update-grub2
+      tags:
+        - azure_kernel
+        - grub_defaults
+
+    - name: Rebooting colo_machine
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.reboot:
+      tags: azure_kernel
+
+    - name: downloading gcc/g++ dependencies
+      when: inventory_hostname in groups['localhost']
+      ansible.builtin.shell: "{{ item }}"
+      with_items: "{{ gcc_deb_download }}"
+      tags: gcc
+
+    - name: packaging gcc into tar
+      when: inventory_hostname in groups['localhost']
+      community.general.archive:
+        path: "/home/swathi/ansible/gcc13"
+        dest: "/home/swathi/ansible/gcc13.tar"
+      tags: gcc
+
+    - name: sending gcc to colo_machine
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.copy:
+        src: "/home/swathi/ansible/gcc13.tar"
+        dest: /tmp/gcc13.tar
+      tags: gcc
+
+    - name: unpacking gcc tar file in colo
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.unarchive:
+        src: /tmp/gcc13.tar
+        dest: /tmp/
+        remote_src: true
+      tags: gcc
+
+    - name: installing gcc packages
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: cd /tmp/gcc13 && dpkg -i *.deb
+      tags: gcc
+
+    - name: flashing community.general on docker container
+      when: inventory_hostname in groups['localhost']
+      ansible.builtin.shell: ansible-galaxy collection install community.general
+      tags: gcc
+
+    - name: updating gcc alternatives
+      when: inventory_hostname in groups['colo_machine']
+      community.general.alternatives:
+        name: gcc
+        link: /usr/bin/gcc
+        path: "/usr/bin/gcc-{{ ZANSKAR_GCC_VERSION }}"
+        subcommands:
+          - name: g++
+            link: "/usr/bin/g++"
+            path: "/usr/bin/g++-{{ ZANSKAR_GCC_VERSION }}"
+          - name: gcov
+            link: /usr/bin/gcov
+            path: "/usr/bin/gcov-{{ ZANSKAR_GCC_VERSION }}"
+          - name: gcov-dump
+            link: /usr/bin/gcov-dump
+            path: "/usr/bin/gcov-dump-{{ ZANSKAR_GCC_VERSION }}"
+          - name: gcov-tool
+            link: /usr/bin/gcov-tool
+            path: "/usr/bin/gcov-tool-{{ ZANSKAR_GCC_VERSION }}"
+          - name: gcc-ar
+            link: /usr/bin/gcc-ar
+            path: "/usr/bin/gcc-ar-{{ ZANSKAR_GCC_VERSION }}"
+          - name: gcc-nm
+            link: /usr/bin/gcc-nm
+            path: "/usr/bin/gcc-nm-{{ ZANSKAR_GCC_VERSION }}"
+          - name: gcc-ranlib
+            link: /usr/bin/gcc-ranlib
+            path: "/usr/bin/gcc-ranlib-{{ ZANSKAR_GCC_VERSION }}"
+        priority: 10
+        state: selected
+      tags:
+        - gcc
+        - alternatives
+
+    - name: cloning repos
+      when: inventory_hostname in groups['localhost']
+      ansible.builtin.git:
+        repo: "{{ item.repo_link }}"
+        dest: "{{ item.dest_path }}"
+        depth: 1
+        version: "{{ item.version }}"
+      loop:
+        - { repo_link: https://github.com/cisco/exanic-software.git , dest_path: "/home/swathi/ansible/exanic-software" , version: v2.7.4 }
+        - { repo_link: https://github.com/richardcochran/linuxptp.git , dest_path: "/home/swathi/ansible/linuxptp" , version: v4.2 }
+      tags: repo_handling
+
+    - name: archiving repos
+      when: inventory_hostname in groups['localhost']
+      community.general.archive:
+        path: "{{ item.repo_path }}"
+        dest: "{{ item.archv_dest }}"
+      loop:
+        - { repo_path: "/home/swathi/ansible/exanic-software" , archv_dest: "/home/swathi/ansible/exanic-software_v2.7.4.tar.gz" }
+        - { repo_path: "/home/swathi/ansible/linuxptp" , archv_dest: "/home/swathi/ansible/linuxptp_v4.2.tar" }
+      tags: repo_handling
+
+    - name: copying repos
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.copy:
+        src: "{{ item.archv_path }}"
+        dest: "{{ item.colo_path }}"
+      loop:
+        - { archv_path: "/home/swathi/ansible/exanic-software_v2.7.4.tar.gz" , colo_path: /tmp/exanic-software_v2.7.4.tar.gz }
+        - { archv_path: "/home/swathi/ansible/linuxptp_v4.2.tar" , colo_path: /tmp/linuxptp_v4.2.tar }
+      tags: repo_handling
+
+    - name: unpacking repos
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.unarchive:
+        src: "{{ item.archv_path }}"
+        dest: /tmp/
+        remote_src: true
+      loop:
+        - { archv_path: /tmp/exanic-software_v2.7.4.tar.gz }
+        - { archv_path: /tmp/linuxptp_v4.2.tar }
+      tags: repo_handling
+
+    - name: installing exanic-software on colo
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: "cd /tmp/exanic-software && make CC=gcc-{{ ZANSKAR_GCC_VERSION }} && make install"
+      tags: exanic_software
+
+    - name: modprobe commands
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: modprobe exanic && modprobe exasock
+      tags: exanic_software
+
+    - name: installing linuxptp on colo
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: cd /tmp/linuxptp && make && make install
+      tags: linuxptp
+
+    - name: updating /opt/ptpd.sh
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.blockinfile:
+        path: /opt/ptpd.sh
+        block: |
+          #!/bin/bash
+
+          sysctl -w net.ipv4.conf.enp1s0.arp_announce=1
+          sysctl -w net.ipv4.conf.enp1s0d1.arp_announce=1
+          sysctl -w net.ipv4.conf.enp1s0.arp_ignore=2
+          sysctl -w net.ipv4.conf.enp1s0d1.arp_ignore=2
+          sysctl -w net.ipv4.conf.enp1s0.arp_filter=0
+          sysctl -w net.ipv4.conf.enp1s0d1.arp_filter=0
+
+          ptp4l -i enp1s0 -m -q > /var/log/ptp4l.log 2>&1 &
+
+          phc2sys -s enp1s0 -w -m -q > /var/log/phc2sys.log 2>&1 &
+
+          sysctl -p;
+
+          while true; do
+                  sync && echo 3 > /proc/sys/vm/drop_caches
+                  sleep 3600
+          done
+        create: yes
+        mode: '0755'
+      tags: linuxptp
+
+    - name: updating zanskar-ptp service file
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system/zanskar-ptp.service
+        line: "{{ item }}"
+        create: yes
+      loop:
+        - "[Unit]"
+        - "Description=zanskar-ptp"
+        - "Wants=network-online.target"
+        - "After=network-online.target"
+        - "[Service]"
+        - "Restart=no"
+        - "#ExecStartPre=/opt/ptpd.sh"
+        - "ExecStart=/opt/ptpd.sh"
+        - "Type=simple"
+        - "User=root"
+        - "KillSignal=SIGINT"
+        - "[Install]"
+        - "WantedBy=multi-user.target"
+      tags: linuxptp
+
+    - name: starting linuxptp service
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: chmod +x /opt/ptpd.sh && service zanskar-ptp start && service zanskar-ptp enable
+      tags: linuxptp
+      ignore_errors: yes
+
+    - name: disabling unnecessary services
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+      loop: "{{ services_to_disable }}"
+      tags:
+        - disable_services
+        - post_installation
+      ignore_errors: yes
+
+    - name: adding group exanic
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.group:
+        name: exanic
+        state: present
+      tags:
+        - zanskar_user
+        - post_installation
+
+    - name: adding user zanskar
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.user:
+        name: zanskar
+        groups: exanic
+        shell: /bin/bash
+        append: yes
+      tags:
+        - zanskar_user
+        - post_installation
+      ignore_errors: yes
+
+    - name: updating exanic rules file
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/udev/rules.d/exanic.rules
+        line: |
+          KERNEL=="exanic*", GROUP="exanic", MODE="0660"
+          KERNEL=="exasock", GROUP="exanic", MODE="0660"
+        create: yes
+      tags:
+        - exanic_permissions
+        - post_installation
+
+    - name: exanic mod commands
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: "{{ item }}"
+      with_items: "{{ exanic_mod_commands }}"
+      tags:
+        - exanic_permissions
+        - post_installation
+
+    - name: setting timezone
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: timedatectl set-timezone Asia/Kolkata
+      tags:
+        - timezone
+        - post_installation
+
+    - name: changing hostname
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.hostname:
+        name: "{{ host_name }}"
+      tags:
+        - hostname
+        - post_installation
+
+    - name: enabling coredump
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: ulimit -S -c unlimited
+      tags:
+        - coredump
+        - post_installation
+
+    - name: enabling coredump permanently
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/security/limits.conf
+        line: '* soft core unlimited'
+      tags:
+        - coredump
+        - post_installation
+
+    - name: make titan_data directory
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: "/home/zanskar/titan_data/{{ item }}"
+        state: directory
+        owner: zanskar
+        group: zanskar
+      loop:
+        - BankNifty/compliance
+        - BankNifty/engine
+        - BankNifty/graph
+        - BankNifty/health
+        - BankNifty/portfolio
+        - BankNifty/portfolio_linehandler
+        - BankNifty/stats
+        - BankNifty/timing
+        - config/graphs
+        - FinNifty/compliance
+        - FinNifty/engine
+        - FinNifty/graph
+        - FinNifty/health
+        - FinNifty/portfolio
+        - FinNifty/portfolio_linehandler
+        - FinNifty/stats
+        - FinNifty/timing
+        - indexBasket
+        - linehandler/orders
+        - linehandler/timing
+        - Nifty/compliance
+        - Nifty/engine
+        - Nifty/graph
+        - Nifty/health
+        - Nifty/portfolio
+        - Nifty/portfolio_linehandler
+        - Nifty/stats
+        - Nifty/timing
+        - NSEStocks/compliance
+        - NSEStocks/engine
+        - NSEStocks/graph
+        - NSEStocks/health
+        - NSEStocks/portfolio
+        - NSEStocks/portfolio_linehandler
+        - NSEStocks/stats
+        - NSEStocks/timing
+        - plots
+        - poscheckLogs
+        - refdata
+        - span
+      tags:
+        - make_directories
+        - post_installation
+
+    - name: make scripts directory
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: "/home/zanskar/scripts/{{ item }}"
+        state: directory
+        owner: zanskar
+        group: zanskar
+      loop:
+        - algo
+        - algoparams
+        - apps
+        - core_allocator
+        - drop_copy
+        - mktdata
+        - poscheck
+      tags:
+        - make_directories
+        - post_installation
+
+    - name: make logs directory
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: "/home/zanskar/logs/{{ item }}"
+        state: directory
+        owner: zanskar
+        group: zanskar
+      loop:
+        - algo
+        - apps
+        - core_allocator
+        - drop_copy
+        - grpc
+        - mktdata
+        - poscheck
+      tags:
+        - make_directories
+        - post_installation
+
+    - name: make config directory
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: "/home/zanskar/logs/{{ item }}"
+        state: directory
+        owner: zanskar
+        group: zanskar
+      loop:
+        - algo
+        - apps
+        - cores
+        - drop_copy
+        - mktdata
+      tags:
+        - make_directories
+        - post_installation
+
+    - name: make home directory
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.file:
+        path: "/home/zanskar/{{ item }}"
+        state: directory
+        owner: zanskar
+        group: zanskar
+      loop:
+        - posCheck/posData
+        - reports
+      tags:
+        - make_directories
+        - post_installation
+    
+    - name: add jenkins key
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/authorized_keys/zanskar
+        line: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCfWHIIpzhFzYRzxV4NqmB91EEkDHwhKK6Tf5tTBMm9+eWPJwlgiysdVGDSZxK74iUUuBr1+lNnTECsx/Hmqa2lRTWfxO6vclwEUwx6/69ffErGg6VTcdl2AXO8IOt44nurCl9qplGW4xtf2Cz7FBirNrBeCONT7bZ4dOOhX8qMFhc/X35HBLhvBnOSKH1xFrt2q/NmWChb3nk0IdqqCHvJi12zrSDJJcJMPCSwrumh/xkD3ifAgX3xndF91sQJvQyTieFpxtTmgWlSPaofnng7FSmG0emcTu6Q879E56rAAtmv2sm7ytgMN1QGQpwMuHnqAcyJUKHDfFZd2L5viOHPkHf8YTHbzReGHPYTt/IEfueHwFO74/AO55LwK19rnvQywy6HhZKib33y25rJRnsJqTklYV9hwWLpsP29FLtd5lVk5lOSTsxIla4ltJ3z9mBxs7PSjqD/IxhuqLe8quuV5ZoXzSNqbeS58U4RdVpMcK5Fv8DW8aMy/+J/kaOb6Fc= jenkins@katarina"
+        create: yes
+      tags:
+        - jenkins_key
+        - post_installation
+      ignore_errors: yes
+    
+    - name: remove non-required apt packages
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: apt remove --purge snapd -y && apt remove --purge avahi -y && apt remove --purge cups -y && apt remove --purge apparmor -y
+      tags:
+        - remove_apt_packages
+        - post_installation
+      ignore_errors: yes
+
+    - name: apt and systemctl cleanup
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.shell: apt autoremove && systemctl daemon-reload
+      tags:
+        - cleanup
+        - post_installation
+      ignore_errors: yes
+
+    - name: add root key
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/authorized_keys/root
+        block: |
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTybKE8pVTHMWvrkFEscRFAWSTf7p1tE4U6zQiloouqKTIdyDDhlViUMjo8KSh4BDNuTNzzSS83gwOGLruMPlqnTpWZ3xzbF8qIg/eA5ewNz0cf39Bvtu57wU+XagnG+U3kBtqHViDJxnrYIz/0T79JEkQpys3FGH456vvDkupTr51D+Y2eoqwEjWEzPVj39GcyN81l6ubu5V2FdxD0l3lHwnXtYukJqZ07Zme3czlqe/5LUK/MpzJ/YSjbJu4qYq0d5VUL3EZC25CPoNOWAAiB8mTL5G06dWi2zCLbyri2Lr42LejPSuVdPZ568VO39GJVZAa6qI7SI9wwfVE2JLJjSmICWNXmDGocE2/howMX9wzydNGafqbEMSsug9Q/KjBjL7ixLNNJJUEqeLhFm/mzbRVLx01ZByWpQHX2qFlIHWo+kkakoBQB0kx/6WeC2u2UcgmIzYf2YSqJcqNJaREeDndWHWNZaav2wKUPSOYv93Z3tt7fAGH3vm1ldiYwlk= asachan@metalstorm
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDMbh93CH5+1wdMIuKCR4vfCkO4Fg+NVybOtRyHIdOL5C+CbpFVlVbPfwaQPzfibH+vzPj8kuJcwQNjoXIguqH+DgGrugJt3+Ikvfhhr/6NskRCQCTnikuQUN/rOZ01dJBFVkWC/43S2mb0YMYRvJXI4ioaL5FwMmYA8PZdSLGyf6OBs8S/Uzc3JLpxb7u22OrRMX5I+lEWRRDBJvq5Fpd44l69RbP4MDIpg8KTz3ax6JtFLxyEaVc6oLd/sb6FgiFn/J4oQ6R2kIDXp0662/7F5eooT40P+oGva/NWBSb/rs1rz6NuwRJRM6qeEjy8e1AK747nGX9G5YlpVWG4PxCHbJUpIDBc7+u9HWYecUU9Qyb/H6Z0gezICMDu9e7RBp6MF2RJvb4CGBIYDpNx9NcloYKBhiTFndcN4jmOfvWJQAq6r+10MXzXVqdAmiiafvlgfYnsy8faTl9qsEcOsuoSHFhe3JwtiLgc9gqed91B+oGfo7zWIZ9UHbaMSpmZMyc= abhay@zanskardev01
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCqfEbcTRrYlubeeTm0XzKDG7YXy8yhtzKG0RFTscw1Y216n1a2mXUaYh89B4s07gSIpMaqwb4tMJIAYHdefpAE06AhFZsPZrhSDuyeYySlu+A8pmgssVT445d4fCDlvJ12HJQVr2t/seMzjjnBYxXsMDaJZDZEKt+QmLUZF6eK2Le7ojZQ4jtV74yBbbvWnxQK6u22Iva1IHCnNrMtSDjnuziJXAuEoxNzuPSnJwV8WWtY+4WtPK/Pufdfk5bMC7juuVw0YmbHzowgMYBRzGROtnGF4+7MNMRhJoigpNKIjqiDKcQ/7nApIheCwxT1QOnLnye84Z1dHqQy606pEmGl1RpNrtqnvqWMQWt0hOEmYtUq99vXxdWBaBJuFNnjGR4We/wY4ZwjkfCAoTWxQvoLkDk094zy4fwHZUe7Lj4bMKegZwE2ap6zIjr8M4e9jEagFVnipqmosXoZXp21u2Pqc/EFfaqXwy4dJvLyTt06szEA4kjCFXRVGtdnyGpSYxM= anshit@anshit
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC5Iv26QtqkM1lpaXSJCSDHXZsZ3VYnQEco+5MeTkXshLnDR907pGFOYBDUXejs55n8cRn8SGwlVQNJi7i3LNz+YRqNikrel0rOYGIY45sheav5JIqKxOHLg38LtSWB7ZSL8k+woOaqcyrhMPpVdtnKv0ZklYjgYPCwzQ9HYZ3d6VOBrYXyEWXTViiJxEOy4uQ5Kp9kjRdKg/NkJzGgPMcYCFQEfVbQUJLsAVjFHeAFhVXuXTRB60xVd5mcCuiBFGg/7e3AZszwLvKbam6j7q8LgCzj3dbLAcmncQtFvOxOG/EljYX49zfK3tn9UTmxDr+GmOUl3Y3Lq2frUpVuFSTRxWz/BD4FRfYFT78K3kW273Z0AsUJ3HMjwmBKYDDtY8Y7YLwiAWZK11KRZToFA5wPlW4WevUFRMbdAhmDecMN6wCQ+xn5ZyyL1Dll84gYgFSo1ZtDo2IVNET99LhgaS4c9yv+Xz9uej7il7iFQad0ObJx8IrzSYzt9EIAHYJvod0= anshit@zanskardev03
+          sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIBOOo7xjx+h03VhiEfuNI/vs6G90d9AZCEDSfm89vEhFAAAADXNzaDpEZXZTZXJ2ZXI= asachan@metalstorm
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC5ppkxUwFp3+9kg8a/T36qffY/1EdmdbBS6N6jLpPzxVtV5LEtLmVINc+IymDk4F5oAZd8GMgbQRn21Fep6M3Y7v4lLljkAw3xYSZRTM5vzU/HH+1n1nUWSYhJwHXr2Of51hBtX8whxGrqYYuKot2cCJ+mvHrdJ+LdJdSGqbfAAO1nxtnPEyFQiE0ar30wTxMiJQniL2aFzDzz9JEdOmc1yS+tO2xuQZ4fqCM1/2zAtl4RTyfAjSe3IJZfraYvDfRu0OBrf2Yyk6JoyGRmJ7X0i4Q7cDE6Cfe4hm8PHFENxMRbiMnTOGuMFY+gTVCqKi7zTKByer3eW4nb+NaV821t2gkc/NEAfprWaAE3gNerGNDmxZOkuaPHElF9ucjfgRN/rPdLJge0rpyueDEOASksL2SKz4yn+ATHMD78OkzrvStWLrWsBHAeppsz2hvcamMFn2giHV+yXpMmy0XBD/x/qYfgLvtghwQnsxDRP0ld4sXh7bG37qOwKjUdIIfI9Fk= pswaroop@zanskardev01
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCLZ3rrparIP0bYebCppBd2owKCjJ1C+zqZQlCSqIqdILZBkkWpKX2ACrGfZwt6e6nNvTYYhLlhpcFrVhqQ+maJKWCXsBdD/d1AsRPXI1ROTDBj9m4zJymTL96dVdIT/IyUddHZieWalw3UgNZe07GuUEsEFaJX2l9kKKuWRqN83XERnsNIOkY5bRgppY/bceVnoWSX+1IICmG76en6ZNqyfeYcBijAgHjiKdMApiQGua5ioj2KHenFiKa4xVl7rO0GY/E+wAYwWT9DYlc/DwFNgVCG+ggqOyOAa8W/VrcSxP2gK3/KhywZioGyXvyyhC6mDdn2J3EGbjjuS09mvX5YdETXTiUwkDqgsVrsDdcd5hh17Cl+k2WEqh9lB5sAFZA8/gpfqT+zv6DzE+UuUY8dBhUetKRKRPhhBzg9eC7jbuoVNAa4wgf5TYFi6nQDRBJk/KR0sQsxNEumbIpvkx0bfegqm/sAzXnF9buRfWERTYVR4UroS7TV8Z+1wzB4FPQeCdrbxH1ah4OR3nn4x55No7JzZ437JA36/AgB9tTRfep2zAYEN3MaJUzrscjf5MLNzLGWd8L5qwwRd090aa1C5nvq/4q/cxZELZG6SDqqL4PSlYTTAKjaHmitDuisqJsDF/caKn1rESAOex87IYvQMFokkfJ73mD4LeLFmL0Pyw== zradmin@muthu
+        create: yes
+      tags:
+        - root_key
+
+    - name: Get hostname
+      command: hostname
+      register: host_name
+      tags: host_info
+
+    - name: Display hostname
+      debug:
+        msg: "Hostname: {{ host_name.stdout }}"
+      tags: host_info
+
+    - name: Get IP address
+      shell: "hostname -I | awk '{print $1}'"
+      register: ip_addr
+      tags: host_info
+
+    - name: Display IP address
+      debug:
+        msg: "IP address: {{ ip_addr.stdout }}"
+      tags: host_info 
+    
+    - name: copying stress-ng
+      when: inventory_hostname in groups['colo_machine']
+      ansible.builtin.copy:
+        src: "{{ item.archv_path }}"
+        dest: "{{ item.colo_path }}"
+      loop:
+        - { archv_path: "/home/swathi/ansible/stress-ng-30min.sh" , colo_path: /root/stress-ng-30min.sh }
+      tags: copy_stress-ng
+
+    - name: Sysstat_enable command
+      when: inventory_hostname in groups['colo_machine']
+      block:
+        - ansible.builtin.shell: systemctl enable sysstat
+        - ansible.builtin.shell: systemctl start sysstat
+        - ansible.builtin.shell: systemctl status sysstat
+      tags:
+        - sysstat_enable 
+
+    
